@@ -1,122 +1,89 @@
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h"
-
+#include "queue.h"
 #include <stdio.h>
 #include "pico/stdlib.h"
-
 #include "hardware/gpio.h"
-#include "hardware/i2c.h"
-#include "pico/stdlib.h"
+#include "hardware/adc.h"
 #include "pins.h"
-#include "ssd1306.h"
 
-// === Definições para SSD1306 ===
-ssd1306_t disp;
+typedef struct {
+    uint8_t axis;
+    int16_t val;
+} adc_t;
 
-QueueHandle_t xQueueBtn;
+QueueHandle_t xQueueADC;
 
-// == funcoes de inicializacao ===
-void btn_callback(uint gpio, uint32_t events) {
-    if (events & GPIO_IRQ_EDGE_FALL) xQueueSendFromISR(xQueueBtn, &gpio, 0);
-}
+#define ADC_WINDOW_SIZE 10
+#define ADC_CENTER 2048
+#define ADC_DEAD_ZONE 150
+#define MOUSE_MAX_SPEED 10
 
-void oled_display_init(void) {
-    i2c_init(i2c1, 400000);
-    gpio_set_function(2, GPIO_FUNC_I2C);
-    gpio_set_function(3, GPIO_FUNC_I2C);
-    gpio_pull_up(2);
-    gpio_pull_up(3);
-
-    disp.external_vcc = false;
-    ssd1306_init(&disp, 128, 64, 0x3C, i2c1);
-    ssd1306_clear(&disp);
-    ssd1306_show(&disp);
-}
-
-void btns_init(void) {
-    gpio_init(BTN_PIN_R);
-    gpio_set_dir(BTN_PIN_R, GPIO_IN);
-    gpio_pull_up(BTN_PIN_R);
-
-    gpio_init(BTN_PIN_G);
-    gpio_set_dir(BTN_PIN_G, GPIO_IN);
-    gpio_pull_up(BTN_PIN_G);
-
-    gpio_init(BTN_PIN_B);
-    gpio_set_dir(BTN_PIN_B, GPIO_IN);
-    gpio_pull_up(BTN_PIN_B);
-
-    gpio_set_irq_enabled_with_callback(BTN_PIN_R,
-                                       GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-                                       true, &btn_callback);
-    gpio_set_irq_enabled(BTN_PIN_G, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-                         true);
-    gpio_set_irq_enabled(BTN_PIN_B, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-                         true);
-}
-
-void led_rgb_init(void) {
-    gpio_init(LED_PIN_R);
-    gpio_set_dir(LED_PIN_R, GPIO_OUT);
-    gpio_put(LED_PIN_R, 1);
-
-    gpio_init(LED_PIN_G);
-    gpio_set_dir(LED_PIN_G, GPIO_OUT);
-    gpio_put(LED_PIN_G, 1);
-
-    gpio_init(LED_PIN_B);
-    gpio_set_dir(LED_PIN_B, GPIO_OUT);
-    gpio_put(LED_PIN_B, 1);
-}
-
-void task_1(void *p) {
-    btns_init();
-    led_rgb_init();
-    oled_display_init();
-
-    uint btn_data;
+void adc_task(void *p) {
+    uint8_t adc_channel = (uint8_t)(uintptr_t)p;
+    uint8_t axis = adc_channel;
+    uint16_t samples[ADC_WINDOW_SIZE] = {0};
+    uint32_t sum = 0;
+    int index = 0;
 
     while (1) {
-        if (xQueueReceive(xQueueBtn, &btn_data, pdMS_TO_TICKS(2000))) {
-            printf("btn: %d \n", btn_data);
+        adc_select_input(adc_channel);
+        uint16_t raw_val = adc_read();
 
-            switch (btn_data) {
-                case BTN_PIN_B:
-                    gpio_put(LED_PIN_B, 0);
-                    ssd1306_draw_string(&disp, 8, 0, 2, "BLUE");
-                    ssd1306_show(&disp);
-                    break;
-                case BTN_PIN_G:
-                    gpio_put(LED_PIN_G, 0);
-                    ssd1306_draw_string(&disp, 8, 24, 2, "GREEN");
-                    ssd1306_show(&disp);
-                    break;
-                case BTN_PIN_R:
-                    gpio_put(LED_PIN_R, 0);
+        sum -= samples[index];
+        samples[index] = raw_val;
+        sum += raw_val;
+        index = (index + 1) % ADC_WINDOW_SIZE;
+        uint16_t filtered_val = sum / ADC_WINDOW_SIZE;
 
-                    ssd1306_draw_string(&disp, 8, 48, 2, "RED");
-                    ssd1306_show(&disp);
-                    break;
-                default:
-                    // Handle other buttons if needed
-                    break;
-            }
-        } else {
-            ssd1306_clear(&disp);
-            ssd1306_show(&disp);
-            gpio_put(LED_PIN_R, 1);
-            gpio_put(LED_PIN_G, 1);
-            gpio_put(LED_PIN_B, 1);
+        int16_t mouse_val = 0;
+        if (filtered_val > ADC_CENTER + ADC_DEAD_ZONE) {
+            mouse_val = (filtered_val - (ADC_CENTER + ADC_DEAD_ZONE)) * MOUSE_MAX_SPEED / (4095 - (ADC_CENTER + ADC_DEAD_ZONE));
+        } else if (filtered_val < ADC_CENTER - ADC_DEAD_ZONE) {
+            mouse_val = (filtered_val - (ADC_CENTER - ADC_DEAD_ZONE)) * MOUSE_MAX_SPEED / (ADC_CENTER - ADC_DEAD_ZONE);
+        }
+        
+        if (mouse_val > MOUSE_MAX_SPEED) mouse_val = MOUSE_MAX_SPEED;
+        if (mouse_val < -MOUSE_MAX_SPEED) mouse_val = -MOUSE_MAX_SPEED;
+
+        if (mouse_val != 0) {
+            adc_t data = {
+                .axis = axis,
+                .val = mouse_val
+            };
+            xQueueSend(xQueueADC, &data, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void uart_task(void *p) {
+    adc_t data;
+    while (1) {
+        if (xQueueReceive(xQueueADC, &data, portMAX_DELAY) == pdPASS) {
+            uint8_t lsb = data.val & 0xFF;
+            uint8_t msb = (data.val >> 8) & 0xFF;
+
+            putchar_raw(0xFF);
+            putchar_raw(data.axis);
+            putchar_raw(lsb);
+            putchar_raw(msb);
         }
     }
 }
 
 int main() {
     stdio_init_all();
+    
+    adc_init();
+    adc_gpio_init(VRX_PIN);
+    adc_gpio_init(VRY_PIN);
 
-    xQueueBtn = xQueueCreate(32, sizeof(uint));
-    xTaskCreate(task_1, "Task 1", 8192, NULL, 1, NULL);
+    xQueueADC = xQueueCreate(16, sizeof(adc_t));
+
+    xTaskCreate(adc_task, "X_Task", 256, (void *)0, 1, NULL);
+    xTaskCreate(adc_task, "Y_Task", 256, (void *)1, 1, NULL);
+    xTaskCreate(uart_task, "UART_Task", 256, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
